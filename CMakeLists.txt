@@ -252,6 +252,61 @@ if(DYNAMATIC_ENABLE_CBC)
 endif()
 
 #-------------------------------------------------------------------------------
+# HiGHS solver setup
+#-------------------------------------------------------------------------------
+
+# HiGHS is an open-source (MIT) MILP solver. When enabled, Dynamatic gains a
+# solver backend that requires no commercial license, which makes the
+# MILP-based buffer placement algorithms usable on any machine.
+option(DYNAMATIC_ENABLE_HIGHS
+  "Build the HiGHS open-source MILP solver backend" ON)
+
+if(DYNAMATIC_ENABLE_HIGHS)
+  # Ask HiGHS to build only its static solver library: the executable, tests
+  # and examples are of no use to us and only slow the build down. These are
+  # plain (non-cache) variables, which take precedence over HiGHS' own
+  # `option()` calls thanks to policy CMP0077.
+  set(BUILD_CXX ON)
+  set(BUILD_CXX_EXE OFF)
+  set(BUILD_TESTING OFF)
+  set(BUILD_EXAMPLES OFF)
+  set(BUILD_SHARED_LIBS OFF)
+  set(ZLIB OFF)
+  set(FAST_BUILD ON)
+
+  FetchContent_Declare(
+    highs
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    URL https://github.com/ERGO-Code/HiGHS/archive/refs/tags/v1.11.0.tar.gz
+    SYSTEM
+  )
+
+  FetchContent_MakeAvailable(highs)
+
+  # Dynamatic inherits LLVM's `-fno-exceptions`, but HiGHS' LP file reader uses
+  # exceptions (see extern/filereaderlp/def.hpp), so restore them for it.
+  if(TARGET highs AND NOT MSVC)
+    target_compile_options(highs PRIVATE -fexceptions)
+  endif()
+
+  # Do not leak the HiGHS-specific build configuration into the rest of the
+  # project (e.g. GoogleTest is configured further down).
+  unset(BUILD_CXX)
+  unset(BUILD_CXX_EXE)
+  unset(BUILD_TESTING)
+  unset(BUILD_EXAMPLES)
+  unset(BUILD_SHARED_LIBS)
+  unset(ZLIB)
+  unset(FAST_BUILD)
+
+  # HiGHS only exposes its include directories privately, so we have to add
+  # them ourselves. `HConfig.h` is generated into the binary directory.
+  include_directories(${highs_SOURCE_DIR}/highs ${highs_BINARY_DIR})
+
+  add_compile_definitions(DYNAMATIC_ENABLE_HIGHS)
+endif()
+
+#-------------------------------------------------------------------------------
 # ABC setup
 #-------------------------------------------------------------------------------
 

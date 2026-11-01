@@ -17,10 +17,17 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 #ifndef DYNAMATIC_GUROBI_NOT_INSTALLED
 #include "gurobi_c++.h"
 #endif // DYNAMATIC_GUROBI_NOT_INSTALLED
+
+#ifdef DYNAMATIC_ENABLE_HIGHS
+/// The HiGHS model class, forward declared so that the heavyweight `Highs.h`
+/// does not have to be included by every file that includes this header.
+class Highs;
+#endif // DYNAMATIC_ENABLE_HIGHS
 
 namespace dynamatic {
 
@@ -217,7 +224,10 @@ public:
 #endif // DYNAMATIC_GUROBI_NOT_INSTALLED
 #ifdef DYNAMATIC_ENABLE_CBC
     CBC,
-#endif      // DYNAMATIC_ENABLE_CBC
+#endif // DYNAMATIC_ENABLE_CBC
+#ifdef DYNAMATIC_ENABLE_HIGHS
+    HIGHS,
+#endif      // DYNAMATIC_ENABLE_HIGHS
     DEFAULT // Dummy option
   };
   SolverKind solverKind;
@@ -270,9 +280,44 @@ public:
   }
 };
 
+/// Creates the variables and constraints expressing the product of an integer
+/// variable with a real variable as a *linear* expression, for the solver
+/// backends that cannot handle the quadratic constraint this product would
+/// otherwise require.
+///
+/// The transformation is exact, i.e. it is not a relaxation: it does not
+/// change the set of solutions of the variables that already existed.
+///
+/// `intVar` must take integer values in [0, intVarUpperBound] and `realVar` must
+/// take values in [0, realVarUpperBound]. Both bounds have to be enforced
+/// elsewhere in the model (or by the variables' own bounds) for the
+/// linearization to be valid.
+///
+/// The integer variable is expanded in binary, i.e. intVar = sum_k 2^k * b_k,
+/// and every product b_k * realVar is carried by an auxiliary continuous
+/// variable `w` constrained by
+///   w <= realVar,                                  w <= realVarUpperBound * b_k,
+///   w >= realVar - realVarUpperBound * (1 - b_k),  w >= 0,
+/// which forces w = b_k * realVar. The returned expression is the linearization
+/// of intVar * realVar itself, and can be used like any other `LinExpr`.
+///
+/// All created variables are named after `prefix`, which therefore has to be
+/// unique within the solver.
+LinExpr linearizeIntegerTimesVar(CPSolver &model, const CPVar &intVar,
+                                 unsigned intVarUpperBound,
+                                 const CPVar &realVar, double realVarUpperBound,
+                                 llvm::StringRef prefix);
+
+/// Same as `linearizeIntegerTimesVar`, for the product of a boolean variable
+/// with a variable taking values in [0, varUpperBound] (a bound that has to be
+/// enforced elsewhere in the model). The boolean variable is already binary, so
+/// no binary expansion is needed.
+LinExpr linearizeBinaryTimesVar(CPSolver &model, const CPVar &binVar,
+                                const CPVar &var, double varUpperBound,
+                                llvm::StringRef prefix);
+
 #ifndef DYNAMATIC_GUROBI_NOT_INSTALLED
 class GurobiSolver : public CPSolver {
-
   std::unique_ptr<GRBEnv> env;
   std::map<CPVar, GRBVar> variables;
   std::unique_ptr<GRBModel> model;
@@ -376,5 +421,76 @@ public:
 };
 
 #endif // DYNAMATIC_ENABLE_CBC
+
+#ifdef DYNAMATIC_ENABLE_HIGHS
+
+/// Solver backend built on top of HiGHS (https://github.com/ERGO-Code/HiGHS),
+/// an open-source (MIT licensed) MILP solver. Contrarily to the CBC backend,
+/// HiGHS is linked into the binary and solves the model in-process, so no
+/// external executable is required at runtime.
+///
+/// Note that HiGHS only supports linear constraints, hence the quadratic
+/// constraints used by some of Dynamatic's MILPs have to be linearized before
+/// they reach this backend (see
+/// `BufferPlacementMILP::addChannelThroughputConstraintsForIntegerLatencyChannel`).
+class HighsSolver : public CPSolver {
+
+  /// The HiGHS model doing all the work.
+  std::unique_ptr<Highs> model;
+
+  /// Column index in the HiGHS model of every constraint programming variable.
+  std::map<CPVar, int> variables;
+
+  /// Variables in the order they were added, used to dump solutions.
+  std::vector<CPVar> varOrder;
+
+  /// Track the added names: prevent adding variables with duplicated names
+  std::set<std::string> names;
+
+  /// The objective to maximize. It is only handed to the model right before
+  /// optimization, since HiGHS stores objective coefficients per column and
+  /// every column must exist by then.
+  LinExpr maxObjective;
+
+public:
+  HighsSolver(int timeout = -1 /* default = no timeout*/,
+              int maxThreads = 4 /* default = maximum 4 threads */);
+
+  /// Defined out of line, where `Highs` is a complete type (it is only forward
+  /// declared in this header).
+  ~HighsSolver() override;
+
+  CPVar addVar(const CPVar &var) override;
+
+  // Create var, add highs var, and then return
+  CPVar addVar(const std::string &name, VarType type, std::optional<double> lb,
+               std::optional<double> ub) override;
+  void addConstr(const TempConstr &constraint,
+                 llvm::StringRef constrName) override;
+
+  void addQConstr(const TempConstr &constraint, llvm::StringRef constrName) override;
+
+  void optimize() override;
+
+  void setMaximizeObjective(const LinExpr &expr) override;
+
+  void write(llvm::StringRef filePath) const override;
+  void writeSol(llvm::StringRef filePath) const override;
+
+  /// Retrieve the value from the solved MILP
+  ///
+  /// Example:
+  /// auto resultMyVar = solver.getValue(myVar);
+  double getValue(const CPVar &var) const override;
+
+  double getObjective() const override;
+
+  // [START LLVM RTTI prerequisites]
+  static bool classof(const CPSolver *b) { return b->getKind() == HIGHS; }
+  static bool classof(const HighsSolver *b) { return true; }
+  // [END LLVM RTTI prerequisites]
+};
+
+#endif // DYNAMATIC_ENABLE_HIGHS
 
 } // namespace dynamatic

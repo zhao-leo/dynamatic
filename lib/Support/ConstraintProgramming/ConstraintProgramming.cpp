@@ -6,10 +6,15 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <thread>
+
+#ifdef DYNAMATIC_ENABLE_HIGHS
+#include "Highs.h"
+#endif // DYNAMATIC_ENABLE_HIGHS
 
 using namespace dynamatic;
 
@@ -782,5 +787,278 @@ void CbcSolver::addConstr(const TempConstr &constraint,
   this->constraints.emplace_back(constrName, constraint);
 }
 #endif // DYNAMATIC_ENABLE_CBC
+
+// -------------------------------------------------------------
+// Linearization of bilinear terms
+// -------------------------------------------------------------
+
+LinExpr linearizeIntegerTimesVar(CPSolver &model, const CPVar &intVar,
+                                            unsigned intVarUpperBound,
+                                            const CPVar &realVar,
+                                            double realVarUpperBound,
+                                            llvm::StringRef prefix) {
+  std::string name = prefix.str();
+
+  // Smallest number of bits that can represent every value in [0, bound].
+  unsigned numBits = 1;
+  while ((1u << numBits) - 1u < intVarUpperBound)
+    ++numBits;
+
+  LinExpr intExpansion;
+  LinExpr product;
+  for (unsigned bit = 0; bit < numBits; ++bit) {
+    double weight = static_cast<double>(1u << bit);
+
+    std::string bitName = name + "_bit" + std::to_string(bit);
+    CPVar bitVar = model.addVar(bitName, BOOLEAN, 0.0, 1.0);
+    intExpansion += weight * bitVar;
+
+    // w = bitVar * realVar, expressed with three linear inequalities (plus the
+    // variable's own non-negativity bound).
+    std::string prodName = name + "_bitprod" + std::to_string(bit);
+    CPVar prod = model.addVar(prodName, REAL, 0.0, realVarUpperBound);
+    model.addConstr(prod <= realVar, prodName + "_le_var");
+    model.addConstr(prod <= realVarUpperBound * bitVar, prodName + "_le_bit");
+    LinExpr lowerBound = LinExpr(realVar);
+    lowerBound -= realVarUpperBound * (1.0 - bitVar);
+    model.addConstr(prod >= lowerBound, prodName + "_ge");
+
+    product += weight * prod;
+  }
+
+  // intVar == sum_k 2^k * b_k
+  model.addConstr(intExpansion == intVar, name + "_expansion");
+  return product;
+}
+
+LinExpr linearizeBinaryTimesVar(CPSolver &model, const CPVar &binVar,
+                                           const CPVar &var,
+                                           double varUpperBound,
+                                           llvm::StringRef prefix) {
+  std::string prodName = prefix.str();
+  CPVar prod = model.addVar(prodName, REAL, 0.0, varUpperBound);
+  model.addConstr(prod <= var, prodName + "_le_var");
+  model.addConstr(prod <= varUpperBound * binVar, prodName + "_le_bit");
+  LinExpr lowerBound = LinExpr(var);
+  lowerBound -= varUpperBound * (1.0 - binVar);
+  model.addConstr(prod >= lowerBound, prodName + "_ge");
+  return LinExpr(prod);
+}
+
+// -------------------------------------------------------------
+// GurobiSolver method implementations
+// -------------------------------------------------------------
+
+#ifdef DYNAMATIC_ENABLE_HIGHS
+
+/// Returns the column of `var` in the HiGHS model, aborting if the variable was
+/// never added to this solver.
+static HighsInt getColumn(const std::map<CPVar, int> &variables,
+                          const CPVar &var) {
+  auto it = variables.find(var);
+  if (it == variables.end())
+    llvm::report_fatal_error(
+        ("Variable " + var.impl->name +
+         " was never added to the HiGHS solver! Aborting...")
+            .c_str());
+  return it->second;
+}
+
+HighsSolver::HighsSolver(int timeout, int maxThreads)
+    : CPSolver(timeout, HIGHS, maxThreads) {
+  model = std::make_unique<Highs>();
+
+  // Suppress outputs to stdout (clashes with the MLIR output file).
+  model->setOptionValue("output_flag", false);
+  model->setOptionValue("log_to_console", false);
+
+  // Always use the same random seed to make the solution deterministic.
+  model->setOptionValue("random_seed", 0);
+
+  if (timeout > 0)
+    model->setOptionValue("time_limit", static_cast<double>(timeout));
+
+  if (maxThreads > 0)
+    model->setOptionValue("threads", static_cast<HighsInt>(maxThreads));
+}
+
+HighsSolver::~HighsSolver() = default;
+
+CPVar HighsSolver::addVar(const std::string &name, VarType type,
+                          std::optional<double> lb, std::optional<double> ub) {
+  auto var = CPVar(name, type, lb, ub);
+  return addVar(var);
+}
+
+CPVar HighsSolver::addVar(const CPVar &var) {
+  if (names.count(var.impl->name)) {
+    llvm::report_fatal_error(
+        llvm::Twine("Adding variable with duplicated names is not permitted! "
+                    "Aborting... (duplicate: ") +
+        var.impl->name + ")");
+  }
+
+  double lb = var.impl->lowerBound.value_or(-kHighsInf);
+  double ub = var.impl->upperBound.value_or(kHighsInf);
+  // Unlike Gurobi, HiGHS has no notion of a binary variable, so instead of
+  // relying on the bounds the user supplied (which may be open) we pin boolean
+  // variables to [0, 1] ourselves, like Gurobi's GRB_BINARY does.
+  if (var.impl->type == BOOLEAN) {
+    lb = std::max(lb, 0.0);
+    ub = std::min(ub, 1.0);
+  }
+
+  // The column is created as a continuous one and only made integral
+  // afterwards, since HiGHS cannot specify the type at creation time.
+  int col = static_cast<int>(model->getNumCol());
+  if (model->addVar(lb, ub) != HighsStatus::kOk)
+    llvm::report_fatal_error("Failed to add a variable to the HiGHS model!");
+
+  if (var.impl->type != REAL &&
+      model->changeColIntegrality(col, HighsVarType::kInteger) !=
+          HighsStatus::kOk) {
+    llvm::report_fatal_error(
+        "Failed to make a variable integral in the HiGHS model!");
+  }
+
+  // Names only show up in the dumped models, so a failure here is not fatal.
+  model->passColName(col, var.impl->name);
+
+  variables[var] = col;
+  varOrder.push_back(var);
+  names.insert(var.impl->name);
+  return var;
+}
+
+void HighsSolver::addConstr(const TempConstr &constraint,
+                            llvm::StringRef constrName) {
+  if (!constraint.expr.quadTerms.empty())
+    llvm::report_fatal_error(
+        "Adding a linear constraint with quadratic terms!");
+
+  const LinExpr &expr = constraint.expr.linexpr;
+  std::vector<HighsInt> indices;
+  std::vector<double> values;
+  indices.reserve(expr.terms.size());
+  values.reserve(expr.terms.size());
+  for (auto &[var, coeff] : expr.terms) {
+    if (coeff == 0.0)
+      continue;
+    indices.push_back(getColumn(variables, var));
+    values.push_back(coeff);
+  }
+
+  // Constraints are normalized to "[expr] [pred] 0", so the constant term moves
+  // to the right-hand side.
+  double rhs = -expr.constant;
+  HighsInt numNZ = static_cast<HighsInt>(indices.size());
+
+  HighsStatus st;
+  if (constraint.pred == LE) {
+    st = model->addRow(-kHighsInf, rhs, numNZ, indices.data(), values.data());
+  } else if (constraint.pred == EQ) {
+    st = model->addRow(rhs, rhs, numNZ, indices.data(), values.data());
+  } else {
+    llvm_unreachable("Unknown predicate!");
+  }
+
+  if (st != HighsStatus::kOk) {
+    llvm::errs() << "Failed to add constraint \"" << constrName
+                 << "\" to the HiGHS model!\n";
+    llvm::report_fatal_error("Failed to add a constraint to the HiGHS model!");
+  }
+}
+
+void HighsSolver::addQConstr(const TempConstr &constraint,
+                             llvm::StringRef constrName) {
+  llvm::report_fatal_error(
+      "Quadratic constraints are unavailable for HiGHS! They must be "
+      "linearized before being added to this solver.");
+}
+
+void HighsSolver::setMaximizeObjective(const LinExpr &expr) {
+  // The coefficients are only handed over to the model in `optimize`, since
+  // HiGHS stores them per column and all columns must exist by then.
+  maxObjective = expr;
+}
+
+void HighsSolver::optimize() {
+  model->changeObjectiveSense(ObjSense::kMaximize);
+  for (auto &[var, coeff] : maxObjective.terms) {
+    if (coeff == 0.0)
+      continue;
+    model->changeColCost(getColumn(variables, var), coeff);
+  }
+  // NOTE: the objective's constant term is ignored, like in the other backends.
+
+  if (model->run() == HighsStatus::kError) {
+    status = ERROR;
+    return;
+  }
+
+  switch (model->getModelStatus()) {
+  case HighsModelStatus::kOptimal:
+    status = OPTIMAL;
+    break;
+  case HighsModelStatus::kTimeLimit:
+  case HighsModelStatus::kIterationLimit:
+  case HighsModelStatus::kObjectiveBound:
+  case HighsModelStatus::kObjectiveTarget:
+  case HighsModelStatus::kSolutionLimit:
+  case HighsModelStatus::kInterrupt:
+    // The solver stopped early; a solution is only usable if one was found.
+    status = model->getSolution().value_valid ? NONOPTIMAL : UNKNOWN;
+    break;
+  case HighsModelStatus::kInfeasible:
+    status = INFEASIBLE;
+    break;
+  case HighsModelStatus::kUnbounded:
+  case HighsModelStatus::kUnboundedOrInfeasible:
+    status = UNBOUNDED;
+    break;
+  default:
+    status = UNKNOWN;
+    break;
+  }
+}
+
+void HighsSolver::write(llvm::StringRef filePath) const {
+  if (model->writeModel(filePath.str()) != HighsStatus::kOk)
+    llvm::errs() << "Failed to write the HiGHS model to " << filePath << "!\n";
+}
+
+void HighsSolver::writeSol(llvm::StringRef filePath) const {
+  if (status != OPTIMAL && status != NONOPTIMAL) {
+    llvm::report_fatal_error("Calling writeSol before the model was solved!");
+  }
+
+  std::ofstream myfile(filePath.str());
+  if (myfile.is_open()) {
+    for (const auto &var : varOrder)
+      myfile << var.impl->name << " = " << getValue(var) << "\n";
+  } else {
+    llvm::errs() << "Unable to open file: " << filePath << "!\n";
+    llvm::report_fatal_error("Unable to open file!");
+  }
+}
+
+double HighsSolver::getValue(const CPVar &var) const {
+  if (status != OPTIMAL && status != NONOPTIMAL) {
+    llvm::errs() << "Solution is not available while retrieving "
+                 << var.impl->name << "!\n";
+    llvm::report_fatal_error("Cannot retrieve the value of variable!");
+  }
+  return model->getSolution().col_value[getColumn(variables, var)];
+}
+
+double HighsSolver::getObjective() const {
+  if (status != OPTIMAL && status != NONOPTIMAL) {
+    llvm::report_fatal_error("Cannot retrieve the objective because the "
+                             "solution is not available!");
+  }
+  return model->getObjectiveValue();
+}
+
+#endif // DYNAMATIC_ENABLE_HIGHS
 
 } // namespace dynamatic

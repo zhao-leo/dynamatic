@@ -941,11 +941,40 @@ void BufferPlacementMILP::
     CPVar &readyBuf = chVars.signalVars[SignalType::READY].bufPresent;
     CPVar &shiftReg = chVars.shiftReg;
 
-    // Token occupancy >= data latency * CFDFC's throughput.
-    model->addQConstr(dataLatency * throughput <= chTokenOccupancy,
-                      "throughput_tokens_lb");
     std::string channelName = getUniqueName(*channel.getUses().begin());
     std::string shiftRegExtraBubblesName = "shiftReg_ub_" + channelName;
+
+    // The bounds below are required by the linearization of the products in
+    // this function. They are the same assumptions the rest of the code base
+    // already relies on (see the linearization of `dataLatency * shiftReg` in
+    // `addBufferAreaAwareObjective`, which uses the same big-M of 100):
+    // - `dataLatency` and `bufNumSlots` are bounded by 100 through the
+    //   "dataBuf_if_dataLatency" and "buffer_presence" constraints, and
+    // - the number of extra bubbles never exceeds the channel's slot number
+    //   while the shift register is used; when it is not used, the variable
+    //   only appears in the constraints below and its exact value is
+    //   irrelevant to the solution.
+    static constexpr unsigned MAX_DATA_LATENCY = 100;
+    static constexpr double MAX_EXTRA_BUBBLES = 100.0;
+    static constexpr double MAX_THROUGHPUT = 101.0;
+
+    // `throughput` is not explicitly bounded from above in the model. The value
+    // below is only used as the big-M constant of the linearization, so it just
+    // has to be larger than any value the variable can take: it is derived from
+    // the token occupancy, which never exceeds the channel's slot number (at
+    // most 100), and from the physical meaning of the variable, which is the
+    // inverse of the initiation interval and therefore never exceeds 1.
+    std::string prefix = throughput.getName() + "_" + channelName;
+
+    // Token occupancy >= data latency * CFDFC's throughput.
+    // The product is linearized since not every solver backend supports
+    // quadratic constraints.
+    LinExpr dataLatencyTimesThroughput =
+        linearizeIntegerTimesVar(*model, dataLatency, MAX_DATA_LATENCY,
+                                 throughput, MAX_THROUGHPUT, prefix + "_dlt");
+    model->addConstr(dataLatencyTimesThroughput <= chTokenOccupancy,
+                     "throughput_tokens_lb");
+
     // Shift registers have more bubbles if II is higher than 1 (i.e.,
     // throughput < 1). In a shift register, every slot forwards data
     // simultaneously, but new tokens only arrive every II cycles. This means
@@ -955,16 +984,18 @@ void BufferPlacementMILP::
     //
     // Create an intermediate variable to represent the extra bubbles
     // of the SHIFT_REG_BREAK_DV buffer.
-    CPVar shiftRegExtraBubbles =
-        model->addVar(shiftRegExtraBubblesName, INTEGER, 0, std::nullopt);
+    CPVar shiftRegExtraBubbles = model->addVar(
+        shiftRegExtraBubblesName, INTEGER, 0.0, MAX_EXTRA_BUBBLES);
 
     // The extra bubbles of SHIFT_REG_BREAK_DV buffer is at least its slot
     // number (dataLatency) minus the ceiling of the product of data latency and
     // CFDFC throughput.
     // We approximate the ceiling function numerically to keep the model linear.
-    model->addQConstr(shiftRegExtraBubbles >=
-                          dataLatency - dataLatency * throughput - 0.99,
-                      shiftRegExtraBubblesName);
+    LinExpr extraBubblesLowerBound = LinExpr(dataLatency);
+    extraBubblesLowerBound -= dataLatencyTimesThroughput;
+    extraBubblesLowerBound -= LinExpr(shiftRegExtraBubbles);
+    model->addConstr(extraBubblesLowerBound <= 0.99,
+                     shiftRegExtraBubblesName);
 
     // Combine the following into a unified constraint:
     // 1. If readyBuf is used, bubble occupancy limits the CFDFC's throughput,
@@ -977,13 +1008,20 @@ void BufferPlacementMILP::
     // throughput. Therefore, constraint 1 becomes:
     // 1. If readyBuf is used, bubble occupancy = CFDFC's throughput;
     //    otherwise, bubble occupancy = 0.
-    // As a result, we model bubble occupancy as 'readyBuf * throughput'. This
-    // term can be linearized, but it is not necessary because this is a
-    // quadratic constaint.
-    model->addQConstr(chTokenOccupancy + readyBuf * throughput +
-                              shiftReg * shiftRegExtraBubbles <=
-                          bufNumSlots,
-                      "throughput_tokens_ub");
+    // As a result, we model bubble occupancy as 'readyBuf * throughput' and
+    // the bubbles of the shift register as 'shiftReg * shiftRegExtraBubbles'.
+    // Both products are linearized for the same reason as above.
+    LinExpr readyBufTimesThroughput = linearizeBinaryTimesVar(
+        *model, readyBuf, throughput, MAX_THROUGHPUT, prefix + "_rbt");
+    LinExpr shiftRegTimesExtraBubbles = linearizeBinaryTimesVar(
+        *model, shiftReg, shiftRegExtraBubbles, MAX_EXTRA_BUBBLES,
+        prefix + "_srt");
+
+    LinExpr tokenOccupancyUpperBound = LinExpr(chTokenOccupancy);
+    tokenOccupancyUpperBound += readyBufTimesThroughput;
+    tokenOccupancyUpperBound += shiftRegTimesExtraBubbles;
+    tokenOccupancyUpperBound -= LinExpr(bufNumSlots);
+    model->addConstr(tokenOccupancyUpperBound <= 0, "throughput_tokens_ub");
   }
 }
 
@@ -1072,17 +1110,41 @@ void BufferPlacementMILP::addBlackboxConstraints(
   }
 }
 
+/// Returns a version of `name` that only uses the characters allowed in a
+/// variable name (alphanumerics and underscores).
+///
+/// The names of the nodes read from a BLIF file contain characters such as '/'
+/// that solvers reject, so they have to be escaped before they can be used as
+/// variable names. The escaping is injective (`_` is doubled and any other
+/// disallowed character is replaced by its hexadecimal escape), which keeps
+/// distinct node names distinct.
+static std::string toVarName(llvm::StringRef name) {
+  std::string result;
+  result.reserve(name.size());
+  for (char c : name) {
+    if (std::isalnum(static_cast<unsigned char>(c))) {
+      result.push_back(c);
+    } else if (c == '_') {
+      result += "__";
+    } else {
+      result += "_x";
+      result += llvm::utohexstr(static_cast<unsigned char>(c));
+      result += "_";
+    }
+  }
+  return result;
+}
+
 void BufferPlacementMILP::addCutSelectionConstraints(
-    std::vector<experimental::Cut> &cutVector) {
-  LinExpr cutSelectionSum = 0;
+    std::vector<experimental::Cut> &cutVector) {  LinExpr cutSelectionSum = 0;
   for (size_t i = 0; i < cutVector.size(); ++i) {
     // Loop over cuts of the node
     auto &cut = cutVector[i];
     // Add cut selection variable to the CPVar model
     CPVar &cutSelection = cut.getCutSelectionVariable();
     cutSelection = model->addVar(
-        (cut.getNode()->str() + "__CutSelection_" + std::to_string(i)), BOOLEAN,
-        0, std::nullopt);
+        toVarName(cut.getNode()->str()) + "__CutSelection_" + std::to_string(i),
+        BOOLEAN, 0, std::nullopt);
     cutSelectionSum += cutSelection;
   }
   // Cut Selection Constraint. Only a single cut of a node can be selected.
@@ -1136,7 +1198,10 @@ void BufferPlacementMILP::addNodeVars(experimental::LogicNetwork *blifData) {
     } else {
       // Create the timing variable for Subject Graph Node. These Nodes need
       // only 1 timing variable, as no buffers can be placed between them.
-      nodeVarIn = model->addVar(node->str(), REAL, 0, std::nullopt);
+      // The node name is taken from the BLIF file, so it has to be escaped
+      // before it can be used as a variable name.
+      nodeVarIn =
+          model->addVar(toVarName(node->str()) + "_t", REAL, 0, std::nullopt);
       nodeVarOut = nodeVarIn;
     }
   }
@@ -1223,6 +1288,11 @@ std::vector<Value> BufferPlacementMILP::findMinimumFeedbackArcSet() {
     modelFeedback = std::make_unique<CbcSolver>();
   } else
 #endif // DYNAMATIC_ENABLE_CBC
+#ifdef DYNAMATIC_ENABLE_HIGHS
+  if (isa<HighsSolver>(this->model)) {
+    modelFeedback = std::make_unique<HighsSolver>();
+  } else
+#endif // DYNAMATIC_ENABLE_HIGHS
 #ifndef DYNAMATIC_GUROBI_NOT_INSTALLED
   if (isa<GurobiSolver>(this->model)) {
     modelFeedback = std::make_unique<GurobiSolver>();
@@ -1445,9 +1515,11 @@ void BufferPlacementMILP::addBufferAreaAwareObjective(
         maxCoefCFDFC * largeSlotPenaltyMul * (bufNumSlots - dataLatency);
     objective -= maxCoefCFDFC * shiftRegPenaltyMul * shiftReg;
 
-    // Linearization of dataLatency * shiftReg
-    CPVar latencyMulShiftReg =
-        model->addVar("latencyMulShiftReg", INTEGER, 0, 100);
+    // Linearization of dataLatency * shiftReg. The variable name has to be
+    // unique across channels, since a fresh variable is created per channel.
+    CPVar latencyMulShiftReg = model->addVar(
+        "latencyMulShiftReg_" + getUniqueName(*channel.getUses().begin()),
+        INTEGER, 0, 100);
     model->addConstr(latencyMulShiftReg <= dataLatency);
     model->addConstr(latencyMulShiftReg <= 100 * shiftReg);
     model->addConstr(latencyMulShiftReg >= dataLatency - (1 - shiftReg) * 100);

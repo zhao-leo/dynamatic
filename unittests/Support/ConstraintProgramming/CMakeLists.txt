@@ -1,4 +1,6 @@
-if (GUROBI_FOUND)
+# The tests run against every solver backend built into Dynamatic, so they are
+# built whenever at least one of them is available (not only with Gurobi).
+if (GUROBI_FOUND OR DYNAMATIC_ENABLE_HIGHS OR DYNAMATIC_ENABLE_CBC)
 add_executable(
   test-constraint-programming
   CPTest.cpp
@@ -8,12 +10,19 @@ target_link_libraries(
   test-constraint-programming
   PUBLIC
   GTest::gtest_main
-  ${GUROBI_CXX_LIBRARY}
-  ${GUROBI_LIBRARY}
 
   LLVMSupport
   DynamaticConstraintProgramming
 )
+
+if (GUROBI_FOUND)
+  target_link_libraries(
+    test-constraint-programming
+    PUBLIC
+    ${GUROBI_CXX_LIBRARY}
+    ${GUROBI_LIBRARY}
+  )
+endif()
 
 enable_testing()
 

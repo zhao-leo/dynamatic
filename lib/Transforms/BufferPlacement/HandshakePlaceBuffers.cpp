@@ -140,6 +140,12 @@ protected:
 #else
       llvm::report_fatal_error("CBC not installed!");
 #endif // DYNAMATIC_ENABLE_CBC
+    } else if (solver == "highs") {
+#ifdef DYNAMATIC_ENABLE_HIGHS
+      solverKind = CPSolver::HIGHS;
+#else
+      llvm::report_fatal_error("HiGHS not installed!");
+#endif // DYNAMATIC_ENABLE_HIGHS
     } else {
       llvm::errs() << "Solver type: " << solver << " is not supported!\n";
       llvm::report_fatal_error("Unsupported solver type!");

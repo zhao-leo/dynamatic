@@ -457,9 +457,15 @@ LogicalResult dynamatic::buffer::extractCFDFC(
     model = std::make_unique<CbcSolver>();
     break;
 #endif // DYNAMATIC_ENABLE_CBC
+#ifdef DYNAMATIC_ENABLE_HIGHS
+  case CPSolver::HIGHS:
+    model = std::make_unique<HighsSolver>();
+    break;
+#endif // DYNAMATIC_ENABLE_HIGHS
   case CPSolver::DEFAULT:
     llvm_unreachable("Default option should not be used! Check if you have "
-                     "correctly installed one of CBC or GUROBI milp solver!");
+                     "correctly installed one of CBC, GUROBI or HIGHS milp "
+                     "solver!");
   }
 
   // Create all MILP variables we need

@@ -326,10 +326,10 @@ public:
                "'mapbuf' (simultaneous technology mapping and buffer "
                "placement)"});
     addOption({MILP_SOLVER,
-               "The MILP solvers to use. Values are 'gurobi' (Dynamatic "
-               "needs to be built with Gurobi support) and 'cbc'. The default "
-               "option is gurobi and it will fall back to cbc if gurobi is not "
-               "available."});
+               "The MILP solver to use. Values are 'gurobi' (Dynamatic needs "
+               "to be built with Gurobi support), 'highs' (open-source solver, "
+               "built by default) and 'cbc'. The default is 'gurobi' when it is "
+               "available, and 'highs' otherwise."});
     addFlag({SHARING, "Use credit-based resource sharing"});
     addFlag({FAST_TOKEN_DELIVERY,
              "Use fast token delivery strategy to build the circuit"});
@@ -763,6 +763,8 @@ CommandResult Compile::execute(CommandArguments &args) {
 
 #ifndef DYNAMATIC_GUROBI_NOT_INSTALLED
   std::string milpSolver = "gurobi";
+#elif defined(DYNAMATIC_ENABLE_HIGHS)
+  std::string milpSolver = "highs";
 #else
   std::string milpSolver = "cbc";
 #endif // DYNAMATIC_GUROBI_NOT_INSTALLED

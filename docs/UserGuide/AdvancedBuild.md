@@ -165,6 +165,37 @@ sudo apt-get install coinor-cbc
 ./build.sh --enable-cbc
 ```
 
+### HiGHS MILP Solver (Open Source, Built by Default)
+
+Dynamatic can also use [HiGHS](https://github.com/ERGO-Code/HiGHS), an
+open-source (MIT licensed) MILP solver, to solve the buffer placement MILPs.
+Contrarily to Cbc, no external executable has to be installed: HiGHS is fetched
+and compiled as a static library as part of Dynamatic's build, so nothing else
+has to be set up and no license is required.
+
+The HiGHS backend is enabled by default. To use it, pass the following flag when
+compiling a kernel:
+
+```sh
+./bin/dynamatic --buffer-algorithm fpl22 --milp-solver highs <kernel>
+```
+
+`--milp-solver highs` is also the default when Dynamatic is built without
+Gurobi, so on a machine without a Gurobi installation the MILP-based buffer
+placement algorithms work out of the box.
+
+> [!NOTE]
+> HiGHS does not support quadratic constraints. The few bilinear terms used by
+> the `costaware` algorithm are therefore linearized (exactly, without relaxing
+> the model) before they are handed to the solver, so all buffer placement
+> algorithms are available with every backend.
+
+To opt out of the HiGHS backend and skip building it, build Dynamatic with:
+
+```sh
+./build.sh --disable-highs
+```
+
 ### Enable Legacy Chisel-Based LSQ Generator
 
 Dynamatic previously uses RTL generators written in Chisel (a hardware

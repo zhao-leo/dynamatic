@@ -27,6 +27,8 @@ Note that you may need super user privileges for any package installation. You c
 
 Dynamatic utilizes Gurobi to optimize the circuit's performance. It is optional and Dynamatic will build properly without it but is useful for more optimized results. Refer to our [Advanced Build](../UserGuide/AdvancedBuild.md) page for guidance on [how to setup the Gurobi solver](../UserGuide/AdvancedBuild.md#1-gurobi).
 
+If you do not have a Gurobi license, Dynamatic can instead use the open-source [HiGHS](https://github.com/ERGO-Code/HiGHS) solver, which is built as part of Dynamatic's build by default and requires no additional setup. See [the HiGHS section](../UserGuide/AdvancedBuild.md#highs-milp-solver-open-source-built-by-default) of the Advanced Build page for details.
+
 > [!TIP]
 > While this section helps you install the dependencies needed to get started with Dynamatic, you can find a list of dependencies used by Dynamatic in the [dependencies](../UserGuide/Dependencies.md) section for a better understanding of how the tool works.
 

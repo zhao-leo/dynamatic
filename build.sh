@@ -33,6 +33,8 @@ List of options:
                                          checking
   --use-prebuilt-llvm                  : download and use the prebuilt LLVM
   --enable-cbc                         : enable the CBC milp solver
+  --disable-highs                      : disable the HiGHS milp solver (enabled by
+                                         default)
   --enable-abc                         : enable the ABC logic synthesis tool
   --build-legacy-lsq                   : build the legacy chisel-based lsq
   --check | -c                         : run tests during build
@@ -147,6 +149,7 @@ PREBUILT_LLVM=0
 BUILD_CHIESEL_LSQ=0
 ENABLE_CBC=0
 CMAKE_DYNAMATIC_ENABLE_CBC=""
+CMAKE_DYNAMATIC_ENABLE_HIGHS=""
 CMAKE_DYNAMATIC_ENABLE_ABC=""
 CMAKE_LLVM_ENABLE_ASSERTIONS=""
 LLVM_DIR="$PWD/build/llvm-project"
@@ -218,6 +221,9 @@ do
           "--enable-cbc")
               CMAKE_DYNAMATIC_ENABLE_CBC="-DDYNAMATIC_ENABLE_CBC=ON"
               ENABLE_CBC=1
+              ;;
+          "--disable-highs")
+              CMAKE_DYNAMATIC_ENABLE_HIGHS="-DDYNAMATIC_ENABLE_HIGHS=OFF"
               ;;
           "--enable-abc")
               CMAKE_DYNAMATIC_ENABLE_ABC="-DDYNAMATIC_ENABLE_ABC=ON"
@@ -377,6 +383,7 @@ if should_run_cmake ; then
             $CMAKE_LLVM_BUILD_OPTIMIZATIONS \
             $CMAKE_DYNAMATIC_ENABLE_XLS \
             $CMAKE_DYNAMATIC_ENABLE_CBC \
+            $CMAKE_DYNAMATIC_ENABLE_HIGHS \
             $CMAKE_DYNAMATIC_ENABLE_ABC \
             $CMAKE_LLVM_ENABLE_ASSERTIONS \
             $CMAKE_DYNAMATIC_ENABLE_LEQ_BINARIES
@@ -393,6 +400,7 @@ if should_run_cmake ; then
         $CMAKE_DYNAMATIC_BUILD_OPTIMIZATIONS \
         $CMAKE_DYNAMATIC_ENABLE_XLS \
         $CMAKE_DYNAMATIC_ENABLE_CBC \
+        $CMAKE_DYNAMATIC_ENABLE_HIGHS \
         $CMAKE_DYNAMATIC_ENABLE_ABC \
         $CMAKE_DYNAMATIC_ENABLE_LEQ_BINARIES
   fi

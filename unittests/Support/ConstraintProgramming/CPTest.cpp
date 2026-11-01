@@ -47,6 +47,7 @@ TEST_P(ParamSolverTest, basicIntegerProgramTest) {
   solver->setMaximizeObjective(2 * x + 2 * y + 3 * z);
   solver->optimize();
 
+#ifndef DYNAMATIC_GUROBI_NOT_INSTALLED
   // [Using Gurobi's API to solve the result]
   GRBEnv env = GRBEnv(true);
   env.start();
@@ -63,6 +64,7 @@ TEST_P(ParamSolverTest, basicIntegerProgramTest) {
 
   model.setObjective(2 * a + 2 * b + 3 * c, GRB_MAXIMIZE);
   model.optimize();
+#endif // DYNAMATIC_GUROBI_NOT_INSTALLED
 
   // Check: The result from our API and from Gurobi's API must be exactly the
   // same.
@@ -209,6 +211,7 @@ TEST_P(ParamSolverTest, BigMConstraintCrossCheck) {
   auto yVal = solver->getValue(y);
   auto objVal = solver->getObjective();
 
+#ifndef DYNAMATIC_GUROBI_NOT_INSTALLED
   // Solve with Gurobi for cross-check
   GRBEnv env(true);
   env.start();
@@ -221,6 +224,7 @@ TEST_P(ParamSolverTest, BigMConstraintCrossCheck) {
 
   model.setObjective(GRBLinExpr(a), GRB_MAXIMIZE);
   model.optimize();
+#endif // DYNAMATIC_GUROBI_NOT_INSTALLED
 
   // Cross-check
   EXPECT_NEAR(10, xVal, 1e-6);
@@ -346,10 +350,80 @@ TEST(LinExprOpTest, ChainedAddSub) {
 
 // [END AI-generated test cases]
 
-// Factories for both solvers
+// The linearization helpers replace a bilinear product with a set of linear
+// constraints. For that replacement to be faithful, the linearized expression
+// must take exactly the value of the product it replaces: not more (which would
+// over-constrain the model) and not less (which would allow spurious solutions).
+// Checking both the maximum and the minimum of the linearized expression pins
+// its value down.
+TEST_P(ParamSolverTest, integerTimesVariableLinearizationIsExact) {
+  const unsigned intMax = 7;
+  const double varMax = 4.0;
+  const std::vector<double> varValues = {0.0, 0.5, 1.0, 2.5, varMax};
+
+  for (unsigned intValue = 0; intValue <= intMax; ++intValue) {
+    for (double varValue : varValues) {
+      double expected = static_cast<double>(intValue) * varValue;
+
+      for (double sign : {1.0, -1.0}) {
+        auto solver = GetParam()();
+        auto intVar =
+            solver->addVar("n", INTEGER, intValue, static_cast<double>(intValue));
+        auto var = solver->addVar("t", REAL, varValue, varValue);
+
+        LinExpr product = linearizeIntegerTimesVar(*solver, intVar, intMax, var,
+                                                   varMax, "prod");
+        solver->setMaximizeObjective(sign * product);
+        solver->optimize();
+
+        ASSERT_EQ(solver->status, CPSolver::OPTIMAL);
+        EXPECT_NEAR(expected, sign * solver->getObjective(), 1e-6);
+      }
+    }
+  }
+}
+
+TEST_P(ParamSolverTest, booleanTimesVariableLinearizationIsExact) {
+  const double varMax = 5.0;
+  const std::vector<double> varValues = {0.0, 1.0, 3.5, varMax};
+
+  for (unsigned boolValue = 0; boolValue <= 1; ++boolValue) {
+    for (VarType varType : {REAL, INTEGER}) {
+      for (double varValue : varValues) {
+        // Integer variables cannot take fractional values.
+        if (varType == INTEGER && std::fmod(varValue, 1.0) != 0.0)
+          continue;
+        double expected = boolValue ? varValue : 0.0;
+
+        for (double sign : {1.0, -1.0}) {
+          auto solver = GetParam()();
+          auto binVar = solver->addVar("b", BOOLEAN, boolValue,
+                                       static_cast<double>(boolValue));
+          auto var = solver->addVar("v", varType, varValue, varValue);
+
+          LinExpr product =
+              linearizeBinaryTimesVar(*solver, binVar, var, varMax, "prod");
+          solver->setMaximizeObjective(sign * product);
+          solver->optimize();
+
+          ASSERT_EQ(solver->status, CPSolver::OPTIMAL);
+          EXPECT_NEAR(expected, sign * solver->getObjective(), 1e-6);
+        }
+      }
+    }
+  }
+}
+
+// Factories for all solvers
 
 #ifdef DYNAMATIC_ENABLE_CBC
 std::unique_ptr<CPSolver> makeCbc() { return std::make_unique<CbcSolver>(); }
+#endif
+
+#ifdef DYNAMATIC_ENABLE_HIGHS
+std::unique_ptr<CPSolver> makeHighs() {
+  return std::make_unique<HighsSolver>();
+}
 #endif
 
 #ifndef DYNAMATIC_GUROBI_NOT_INSTALLED
@@ -358,14 +432,35 @@ std::unique_ptr<CPSolver> makeGurobi() {
 }
 #endif
 
-#ifdef DYNAMATIC_ENABLE_CBC
+#if defined(DYNAMATIC_ENABLE_CBC) && defined(DYNAMATIC_ENABLE_HIGHS)
 // clang-format off
-// Runs all MILP test with two different solvers
+// Runs all MILP tests with every available solver backend
+INSTANTIATE_TEST_SUITE_P(
+  SolverImplementations,
+  ParamSolverTest,
+  ::testing::Values(
+    makeCbc,
+    makeHighs
+  )
+);
+// clang-format on
+#elif defined(DYNAMATIC_ENABLE_CBC)
+// clang-format off
 INSTANTIATE_TEST_SUITE_P(
   SolverImplementations,
   ParamSolverTest,
   ::testing::Values(
     makeCbc
+  )
+);
+// clang-format on
+#elif defined(DYNAMATIC_ENABLE_HIGHS)
+// clang-format off
+INSTANTIATE_TEST_SUITE_P(
+  SolverImplementations,
+  ParamSolverTest,
+  ::testing::Values(
+    makeHighs
   )
 );
 // clang-format on

@@ -67,9 +67,15 @@ public:
       model = std::make_unique<CbcSolver>(timeout);
       break;
 #endif // DYNAMATIC_ENABLE_CBC
+#ifdef DYNAMATIC_ENABLE_HIGHS
+    case CPSolver::HIGHS:
+      model = std::make_unique<HighsSolver>(timeout);
+      break;
+#endif // DYNAMATIC_ENABLE_HIGHS
     case CPSolver::DEFAULT:
       llvm_unreachable("Default option should not be used! Check if you have "
-                       "correctly installed one of CBC or GUROBI milp solver!");
+                       "correctly installed one of CBC, GUROBI or HIGHS milp "
+                       "solver!");
     }
   };
 
